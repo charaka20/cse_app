@@ -1,7 +1,7 @@
 """
 llm_extractor.py
 ----------------
-Sends filtered PDF text to Google Gemini (gemini-1.5-flash) and
+Sends filtered PDF text to DeepSeek API (deepseek-chat) and
 extracts a structured JSON payload describing shareholder/director records.
 
 Output JSON schema (minified to save tokens):
@@ -15,10 +15,10 @@ Output JSON schema (minified to save tokens):
     ]
 
 Environment variable required:
-    GEMINI_API_KEY — your Google AI Studio API key
+    DEEPSEEK_API_KEY — your DeepSeek API key from https://platform.deepseek.com
 
 Notes:
-  - Uses response_mime_type="application/json" for deterministic JSON output.
+  - DeepSeek uses an OpenAI-compatible API, so we use the openai Python client.
   - Falls back gracefully to [] on any API/parse error.
   - Token-aware: the prompt is kept minimal; only relevant page text is sent.
 """
@@ -26,16 +26,15 @@ Notes:
 import json
 import logging
 import os
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-MODEL_NAME = "gemini-1.5-flash"
-MAX_INPUT_CHARS = 30_000   # Safety ceiling; Gemini flash handles ~1M tokens
-                            # but we want fast, cheap responses.
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+MODEL_NAME = "deepseek-chat"
+MAX_INPUT_CHARS = 30_000   # Safety ceiling to keep responses fast and cheap
 
 SYSTEM_PROMPT = (
     "You are a financial data extraction engine for the Colombo Stock Exchange (CSE). "
@@ -71,7 +70,7 @@ Document text:
 # ---------------------------------------------------------------------------
 def extract_records(text: str) -> list[dict]:
     """
-    Send `text` to Gemini and return a list of extracted records.
+    Send `text` to DeepSeek and return a list of extracted records.
 
     Args:
         text: Filtered PDF text from parser.py.
@@ -84,11 +83,11 @@ def extract_records(text: str) -> list[dict]:
         logger.warning("llm_extractor received empty text — skipping LLM call.")
         return []
 
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         logger.error(
-            "GEMINI_API_KEY environment variable is not set. "
-            "Cannot call Gemini API."
+            "DEEPSEEK_API_KEY environment variable is not set. "
+            "Cannot call DeepSeek API."
         )
         return []
 
@@ -101,60 +100,72 @@ def extract_records(text: str) -> list[dict]:
             MAX_INPUT_CHARS,
         )
 
-    return _call_gemini(api_key, truncated_text)
+    return _call_deepseek(api_key, truncated_text)
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-def _call_gemini(api_key: str, document_text: str) -> list[dict]:
-    """Call Gemini API and parse the JSON response."""
+def _call_deepseek(api_key: str, document_text: str) -> list[dict]:
+    """
+    Call DeepSeek via OpenAI-compatible client and parse the JSON response.
+    DeepSeek's API is fully compatible with the openai Python package.
+    """
     try:
-        import google.generativeai as genai  # noqa: PLC0415
+        from openai import OpenAI  # noqa: PLC0415
 
-        genai.configure(api_key=api_key)
-
-        model = genai.GenerativeModel(
-            model_name=MODEL_NAME,
-            system_instruction=SYSTEM_PROMPT,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                temperature=0.0,      # Deterministic extraction
-                max_output_tokens=4096,
-            ),
+        client = OpenAI(
+            api_key=api_key,
+            base_url=DEEPSEEK_BASE_URL,
         )
 
         prompt = USER_PROMPT_TEMPLATE.format(document_text=document_text)
-        response = model.generate_content(prompt)
 
-        raw_text = response.text.strip()
-        logger.debug("Gemini raw response (%d chars): %s", len(raw_text), raw_text[:500])
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
+            temperature=0.0,       # Deterministic extraction
+            max_tokens=4096,
+            response_format={"type": "json_object"},  # DeepSeek JSON mode
+        )
 
+        raw_text = response.choices[0].message.content.strip()
+        logger.debug(
+            "DeepSeek raw response (%d chars): %s", len(raw_text), raw_text[:500]
+        )
+
+        # DeepSeek JSON mode returns a top-level object; our schema is an array.
+        # If the model wrapped the array, unwrap it.
         return _parse_and_validate(raw_text)
 
     except ImportError:
         logger.error(
-            "google-generativeai package is not installed. "
-            "Run: pip install google-generativeai"
+            "openai package is not installed. Run: pip install openai"
         )
         return []
     except Exception as exc:  # pylint: disable=broad-except
-        logger.error("Gemini API call failed: %s", exc, exc_info=True)
+        logger.error("DeepSeek API call failed: %s", exc, exc_info=True)
         return []
 
 
 def _parse_and_validate(raw_json: str) -> list[dict]:
     """
-    Parse the JSON string from Gemini and validate the schema.
+    Parse the JSON string from DeepSeek and validate the schema.
+
+    Handles two shapes:
+      - Direct array:  [{"n":...}, ...]
+      - Wrapped object: {"records": [{"n":...}, ...]}
 
     Returns a clean list of {"n": str, "p": str, "a": str} dicts.
     Invalid records are dropped with a warning.
     """
-    # Strip markdown code fences if Gemini added them despite instructions
+    # Strip markdown code fences just in case
     cleaned = raw_json.strip()
     if cleaned.startswith("```"):
         lines = cleaned.split("\n")
-        # Remove first and last fence lines
         cleaned = "\n".join(
             line for line in lines
             if not line.strip().startswith("```")
@@ -164,15 +175,28 @@ def _parse_and_validate(raw_json: str) -> list[dict]:
         data = json.loads(cleaned)
     except json.JSONDecodeError as exc:
         logger.error(
-            "Failed to parse Gemini JSON response: %s\nRaw: %s",
+            "Failed to parse DeepSeek JSON response: %s\nRaw: %s",
             exc,
             raw_json[:1000],
         )
         return []
 
+    # Unwrap if DeepSeek returned {"records": [...]} or {"data": [...]}
+    if isinstance(data, dict):
+        for key in ("records", "data", "shareholders", "directors", "results"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+        else:
+            logger.error(
+                "Expected a JSON array from DeepSeek, got a dict with keys: %s",
+                list(data.keys()),
+            )
+            return []
+
     if not isinstance(data, list):
         logger.error(
-            "Expected a JSON array from Gemini, got %s.", type(data).__name__
+            "Expected a JSON array from DeepSeek, got %s.", type(data).__name__
         )
         return []
 
@@ -201,7 +225,7 @@ def _parse_and_validate(raw_json: str) -> list[dict]:
         valid_records.append({"n": n, "p": p, "a": a})
 
     logger.info(
-        "LLM extracted %d valid record(s) from %d raw record(s).",
+        "DeepSeek extracted %d valid record(s) from %d raw record(s).",
         len(valid_records),
         len(data),
     )

@@ -13,7 +13,7 @@ Pillow==10.3.0               # PIL image processing (required by pdf2image)
 pytesseract==0.3.10          # Python wrapper for Tesseract OCR engine
 
 # ── AI / LLM ─────────────────────────────────────────────────────────────────
-google-generativeai==0.7.2   # Google Gemini API client
+openai==1.35.0               # OpenAI-compatible client — used for DeepSeek API
 
 # ── Utilities ────────────────────────────────────────────────────────────────
 python-dotenv==1.0.1         # Load .env file for local development
