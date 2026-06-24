@@ -1,26 +1,13 @@
 """
 llm_extractor.py
 ----------------
-Sends filtered PDF text to DeepSeek API (deepseek-chat) and
-extracts a structured JSON payload describing shareholder/director records.
+Token-minimizing AI layer using DeepSeek API.
 
-Output JSON schema (minified to save tokens):
-    [
-        {
-            "n": "Shareholder or Director Name",
-            "p": "Percentage or Share Count (string)",
-            "a": "B|S|H"   # B=Buy/Increase, S=Sell/Decrease, H=Hold
-        },
-        ...
-    ]
+Output schema (single-char keys to minimize generation tokens):
+    [{"n": "Name", "p": "Percentage/Volume", "a": "B|S|H"}]
+    a = Action: B=Buy/Increase, S=Sell/Decrease, H=Hold/Unchanged
 
-Environment variable required:
-    DEEPSEEK_API_KEY — your DeepSeek API key from https://platform.deepseek.com
-
-Notes:
-  - DeepSeek uses an OpenAI-compatible API, so we use the openai Python client.
-  - Falls back gracefully to [] on any API/parse error.
-  - Token-aware: the prompt is kept minimal; only relevant page text is sent.
+Environment variable required: DEEPSEEK_API_KEY
 """
 
 import json
@@ -29,204 +16,111 @@ import os
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-MODEL_NAME = "deepseek-chat"
-MAX_INPUT_CHARS = 30_000   # Safety ceiling to keep responses fast and cheap
+DEEPSEEK_BASE = "https://api.deepseek.com"
+MODEL = "deepseek-chat"
+MAX_CHARS = 28_000  # hard ceiling — truncate beyond this
 
-SYSTEM_PROMPT = (
-    "You are a financial data extraction engine for the Colombo Stock Exchange (CSE). "
-    "Your sole job is to extract shareholder and/or director dealings data from "
-    "the document text provided. Output ONLY a minified JSON array. "
-    "No markdown, no explanation, no extra text — just the raw JSON array."
+# Minified system prompt — every word costs tokens
+SYSTEM = (
+    "Extract CSE shareholder/director data. "
+    "Output ONLY a JSON array. No text, no markdown. "
+    'Schema: [{"n":"Name","p":"Shares/%","a":"B|S|H"}] '
+    "a=B(bought/increased),S(sold/decreased),H(held/unchanged)."
 )
 
-USER_PROMPT_TEMPLATE = """
-Extract all shareholder and director records from the following CSE document text.
-
-For each person or entity, return a JSON object with EXACTLY these keys:
-  "n"  — Full name of the shareholder or director (string)
-  "p"  — Number of shares held OR percentage of total shares (string, include % or share count as found)
-  "a"  — Action code: "B" if shares increased/bought, "S" if shares decreased/sold, "H" if unchanged/held
-
-Rules:
-- If the document is a "Top 20 Shareholders" list, set "a" to "H" unless a change is explicitly mentioned.
-- If the document is a "Dealings by Directors" disclosure, infer "B" or "S" from context.
-- Include ALL named entities (individuals and companies).
-- If you cannot determine the action, default to "H".
-- Output ONLY the JSON array. No preamble, no markdown code fences.
-
-Document text:
----
-{document_text}
----
-"""
+USER_TMPL = "Extract from this CSE document:\n---\n{text}\n---"
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-def extract_records(text: str) -> list[dict]:
+def extract(text: str) -> list[dict]:
     """
-    Send `text` to DeepSeek and return a list of extracted records.
+    Send filtered text to DeepSeek and return parsed records.
 
-    Args:
-        text: Filtered PDF text from parser.py.
-
-    Returns:
-        List of dicts with keys "n", "p", "a".
-        Returns [] on any failure.
+    Returns [] on any failure.
     """
     if not text or not text.strip():
-        logger.warning("llm_extractor received empty text — skipping LLM call.")
+        logger.warning("LLM: empty input, skipping.")
         return []
 
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    if not api_key:
-        logger.error(
-            "DEEPSEEK_API_KEY environment variable is not set. "
-            "Cannot call DeepSeek API."
-        )
+    key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not key:
+        logger.error("DEEPSEEK_API_KEY not set.")
         return []
 
-    # Truncate to stay within safe input limits
-    truncated_text = text[:MAX_INPUT_CHARS]
-    if len(text) > MAX_INPUT_CHARS:
-        logger.warning(
-            "Input text truncated from %d to %d characters for LLM.",
-            len(text),
-            MAX_INPUT_CHARS,
-        )
+    # Truncate to ceiling — saves tokens on large financials
+    if len(text) > MAX_CHARS:
+        logger.warning("LLM: input truncated %d→%d chars.", len(text), MAX_CHARS)
+        text = text[:MAX_CHARS]
 
-    return _call_deepseek(api_key, truncated_text)
+    return _call(key, text)
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-def _call_deepseek(api_key: str, document_text: str) -> list[dict]:
-    """
-    Call DeepSeek via OpenAI-compatible client and parse the JSON response.
-    DeepSeek's API is fully compatible with the openai Python package.
-    """
+def _call(key: str, text: str) -> list[dict]:
     try:
-        from openai import OpenAI  # noqa: PLC0415
+        from openai import OpenAI
+        client = OpenAI(api_key=key, base_url=DEEPSEEK_BASE)
 
-        client = OpenAI(
-            api_key=api_key,
-            base_url=DEEPSEEK_BASE_URL,
-        )
-
-        prompt = USER_PROMPT_TEMPLATE.format(document_text=document_text)
-
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
+        resp = client.chat.completions.create(
+            model=MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": prompt},
+                {"role": "system", "content": SYSTEM},
+                {"role": "user",   "content": USER_TMPL.format(text=text)},
             ],
-            temperature=0.0,       # Deterministic extraction
-            max_tokens=4096,
-            response_format={"type": "json_object"},  # DeepSeek JSON mode
+            temperature=0.0,
+            max_tokens=2048,
+            response_format={"type": "json_object"},
         )
 
-        raw_text = response.choices[0].message.content.strip()
-        logger.debug(
-            "DeepSeek raw response (%d chars): %s", len(raw_text), raw_text[:500]
-        )
-
-        # DeepSeek JSON mode returns a top-level object; our schema is an array.
-        # If the model wrapped the array, unwrap it.
-        return _parse_and_validate(raw_text)
+        raw = resp.choices[0].message.content.strip()
+        logger.debug("DeepSeek raw: %s", raw[:300])
+        return _parse(raw)
 
     except ImportError:
-        logger.error(
-            "openai package is not installed. Run: pip install openai"
-        )
+        logger.error("openai package missing. Run: pip install openai")
         return []
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.error("DeepSeek API call failed: %s", exc, exc_info=True)
+    except Exception as exc:
+        logger.error("DeepSeek call failed: %s", exc)
         return []
 
 
-def _parse_and_validate(raw_json: str) -> list[dict]:
-    """
-    Parse the JSON string from DeepSeek and validate the schema.
-
-    Handles two shapes:
-      - Direct array:  [{"n":...}, ...]
-      - Wrapped object: {"records": [{"n":...}, ...]}
-
-    Returns a clean list of {"n": str, "p": str, "a": str} dicts.
-    Invalid records are dropped with a warning.
-    """
-    # Strip markdown code fences just in case
-    cleaned = raw_json.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.split("\n")
-        cleaned = "\n".join(
-            line for line in lines
-            if not line.strip().startswith("```")
-        ).strip()
+def _parse(raw: str) -> list[dict]:
+    """Parse and validate the JSON response from DeepSeek."""
+    # Strip accidental code fences
+    s = raw.strip()
+    if s.startswith("```"):
+        s = "\n".join(l for l in s.split("\n") if not l.strip().startswith("```"))
 
     try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        logger.error(
-            "Failed to parse DeepSeek JSON response: %s\nRaw: %s",
-            exc,
-            raw_json[:1000],
-        )
+        data = json.loads(s.strip())
+    except json.JSONDecodeError as e:
+        logger.error("JSON parse failed: %s | raw: %s", e, raw[:500])
         return []
 
-    # Unwrap if DeepSeek returned {"records": [...]} or {"data": [...]}
+    # DeepSeek JSON mode may wrap array in a dict
     if isinstance(data, dict):
-        for key in ("records", "data", "shareholders", "directors", "results"):
-            if isinstance(data.get(key), list):
-                data = data[key]
+        for v in data.values():
+            if isinstance(v, list):
+                data = v
                 break
         else:
-            logger.error(
-                "Expected a JSON array from DeepSeek, got a dict with keys: %s",
-                list(data.keys()),
-            )
+            logger.error("Expected array, got dict keys: %s", list(data.keys()))
             return []
 
     if not isinstance(data, list):
-        logger.error(
-            "Expected a JSON array from DeepSeek, got %s.", type(data).__name__
-        )
+        logger.error("Expected list, got %s", type(data).__name__)
         return []
 
-    valid_records: list[dict] = []
-    valid_actions = {"B", "S", "H"}
-
-    for i, record in enumerate(data):
-        if not isinstance(record, dict):
-            logger.warning("Record %d is not a dict — skipping.", i)
+    valid = []
+    for rec in data:
+        if not isinstance(rec, dict):
             continue
-
-        n = str(record.get("n", "")).strip()
-        p = str(record.get("p", "")).strip()
-        a = str(record.get("a", "H")).strip().upper()
-
+        n = str(rec.get("n", "")).strip()
+        p = str(rec.get("p", "")).strip()
+        a = str(rec.get("a", "H")).strip().upper()
         if not n:
-            logger.warning("Record %d has empty 'n' (name) — skipping.", i)
             continue
-
-        if a not in valid_actions:
-            logger.warning(
-                "Record %d has invalid action '%s' — defaulting to 'H'.", i, a
-            )
+        if a not in ("B", "S", "H"):
             a = "H"
+        valid.append({"n": n, "p": p, "a": a})
 
-        valid_records.append({"n": n, "p": p, "a": a})
-
-    logger.info(
-        "DeepSeek extracted %d valid record(s) from %d raw record(s).",
-        len(valid_records),
-        len(data),
-    )
-    return valid_records
+    logger.info("LLM: %d valid record(s) extracted.", len(valid))
+    return valid

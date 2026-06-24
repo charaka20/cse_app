@@ -1,211 +1,126 @@
 """
 notifier.py
 -----------
-Sends formatted alerts to a Telegram chat via the Bot API.
+Telegram push interface.
 
-Two public functions:
-  send_alert(message)         — Normal stock movement / disclosure alert.
-  send_health_alert(message)  — System error / scraper failure warning.
+Functions:
+    send_alert(message)           — Standard stock movement alert
+    send_health_alert(error_msg)  — System failure warning
 
-Environment variables required:
-  TELEGRAM_BOT_TOKEN  — Bot token from @BotFather (e.g. "123456:ABC-DEF...")
-  TELEGRAM_CHAT_ID    — Chat/channel ID to send messages to (e.g. "-1001234567890")
-
-Messages use Telegram HTML parse mode for formatting.
+Uses Telegram HTML parse mode for bold/link formatting.
+Reads TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from environment.
 """
 
 import logging
 import os
-from typing import Optional
-
 import requests
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/sendMessage"
-REQUEST_TIMEOUT = 15  # seconds
+TG_URL = "https://api.telegram.org/bot{token}/sendMessage"
+TIMEOUT = 15
 
-ACTION_EMOJI = {
-    "B": "🟢",   # Buy / Increase
-    "S": "🔴",   # Sell / Decrease
-    "H": "⚪",   # Hold / No change
-}
-ACTION_LABEL = {
-    "B": "BUY / ↑",
-    "S": "SELL / ↓",
-    "H": "HOLD",
-}
+ACTION_EMOJI = {"B": "🟢", "S": "🔴", "H": "⚪"}
+ACTION_LABEL = {"B": "BUY ↑", "S": "SELL ↓", "H": "HOLD"}
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-def send_alert(
-    announcement: dict,
-    records: list[dict],
-    has_whale: bool = False,
-) -> bool:
+def send_alert(announcement: dict, records: list[dict]) -> bool:
     """
-    Send a formatted CSE disclosure alert to Telegram.
+    Send a formatted CSE disclosure alert.
 
     Args:
-        announcement:  Dict with keys "id", "title", "company", "pdf_url".
-        records:       List of enriched dicts from logic_mapper.enrich().
-        has_whale:     Whether any whale movement was detected.
-
-    Returns:
-        True if message was sent successfully, False otherwise.
+        announcement: {"id", "company", "description", "pdf_url"}
+        records:      enriched list from logic_mapper
     """
-    message = _format_alert(announcement, records, has_whale)
-    return _send(message)
-
-
-def send_health_alert(error_message: str) -> bool:
-    """
-    Send a system health warning to Telegram.
-
-    Args:
-        error_message: Description of the failure.
-
-    Returns:
-        True if message was sent successfully, False otherwise.
-    """
-    message = (
-        "🚨 <b>CSE Tracker — System Alert</b>\n\n"
-        "⚠️ The scraper encountered an error and may have missed announcements.\n\n"
-        f"<b>Error:</b>\n<code>{_escape_html(error_message[:1000])}</code>\n\n"
-        "📋 Check GitHub Actions logs for the full traceback."
-    )
-    return _send(message)
-
-
-def send_dry_run_summary(announcements_found: int, skipped: int) -> bool:
-    """
-    Send a dry-run summary (no real processing). Used with --dry-run flag.
-    """
-    message = (
-        "🔍 <b>CSE Tracker — Dry Run Summary</b>\n\n"
-        f"📋 Announcements found: <b>{announcements_found}</b>\n"
-        f"⏩ Already processed (skipped): <b>{skipped}</b>\n"
-        f"🆕 New (would process): <b>{announcements_found - skipped}</b>\n\n"
-        "<i>No alerts sent — dry run mode.</i>"
-    )
-    return _send(message)
-
-
-# ---------------------------------------------------------------------------
-# Message formatting
-# ---------------------------------------------------------------------------
-def _format_alert(
-    announcement: dict,
-    records: list[dict],
-    has_whale: bool,
-) -> str:
-    """Build a richly formatted Telegram HTML message."""
-    company = _escape_html(announcement.get("company", "Unknown Company"))
-    title = _escape_html(announcement.get("title", "Announcement"))
-    pdf_url = announcement.get("pdf_url", "")
-    ann_id = _escape_html(str(announcement.get("id", "")))
+    whale_flag = any(r.get("whale") for r in records)
+    lines = []
 
     # Header
-    whale_banner = "🐋 <b>WHALE MOVEMENT DETECTED</b>\n\n" if has_whale else ""
-    lines = [
-        f"{whale_banner}"
-        f"📌 <b>CSE Disclosure Alert</b>\n"
-        f"🏢 <b>Company:</b> {company}\n"
-        f"📄 <b>Type:</b> {title}\n"
-        f"🆔 <b>ID:</b> <code>{ann_id}</code>",
+    if whale_flag:
+        lines.append("🐋 <b>WHALE MOVEMENT DETECTED</b>")
+        lines.append("")
+
+    lines += [
+        "📌 <b>CSE Disclosure</b>",
+        f"🏢 <b>Company:</b> {_esc(announcement.get('company', '?'))}",
+        f"📄 <b>Type:</b> {_esc(announcement.get('description', '?'))}",
+        f"🆔 <b>ID:</b> <code>{_esc(str(announcement.get('id', '?')))}</code>",
     ]
 
-    if pdf_url:
-        lines.append(f'📎 <a href="{pdf_url}">View PDF</a>')
+    pdf = announcement.get("pdf_url", "")
+    if pdf:
+        lines.append(f'📎 <a href="{pdf}">View PDF</a>')
 
-    lines.append("\n<b>── Extracted Data ──</b>")
+    lines.append("")
+    lines.append("<b>── Extracted Records ──</b>")
 
-    # Records table
     if records:
-        for rec in records:
-            name = _escape_html(rec.get("n", "Unknown"))
-            pct = _escape_html(rec.get("p", "—"))
-            action_code = rec.get("a", "H")
-            emoji = ACTION_EMOJI.get(action_code, "⚪")
-            label = ACTION_LABEL.get(action_code, "HOLD")
-            whale = rec.get("whale")
-            group = rec.get("group")
-
-            line = f"{emoji} <b>{name}</b> — {pct} [{label}]"
-            if whale:
-                line += f"\n   ↳ 🐋 <i>{_escape_html(whale)}"
-                if group:
-                    line += f" / {_escape_html(group)}"
-                line += "</i>"
+        for r in records:
+            a = r.get("a", "H")
+            line = (
+                f"{ACTION_EMOJI.get(a, '⚪')} "
+                f"<b>{_esc(r.get('n', '?'))}</b> — "
+                f"{_esc(r.get('p', '—'))} [{ACTION_LABEL.get(a, 'HOLD')}]"
+            )
+            if r.get("whale"):
+                line += (
+                    f"\n   ↳ 🐋 <i>{_esc(r['whale'])}"
+                    + (f" / {_esc(r['group'])}" if r.get("group") else "")
+                    + "</i>"
+                )
             lines.append(line)
     else:
-        lines.append("<i>No structured data extracted from this disclosure.</i>")
+        lines.append("<i>No structured data extracted.</i>")
 
-    # Footer
-    lines.append(
-        "\n<i>Powered by CSE Tracker · Colombo Stock Exchange</i>"
+    lines.append("")
+    lines.append("<i>CSE Tracker · Colombo Stock Exchange</i>")
+
+    return _send("\n".join(lines))
+
+
+def send_health_alert(error_msg: str) -> bool:
+    """Send a system failure warning to Telegram."""
+    msg = (
+        "🚨 <b>CSE Tracker — System Alert</b>\n\n"
+        "⚠️ Scraper or pipeline failure detected.\n\n"
+        f"<b>Error:</b>\n<code>{_esc(error_msg[:1000])}</code>\n\n"
+        "📋 Check GitHub Actions logs."
     )
-
-    return "\n".join(lines)
+    return _send(msg)
 
 
 # ---------------------------------------------------------------------------
-# Internal transport
+# Internal
 # ---------------------------------------------------------------------------
-def _send(message: str) -> bool:
-    """POST a message to the Telegram Bot API."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+def _send(text: str) -> bool:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat  = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-    if not token:
-        logger.error(
-            "TELEGRAM_BOT_TOKEN is not set. Cannot send Telegram message."
-        )
+    if not token or not chat:
+        logger.error("Telegram credentials missing from environment.")
         return False
-    if not chat_id:
-        logger.error(
-            "TELEGRAM_CHAT_ID is not set. Cannot send Telegram message."
-        )
-        return False
-
-    url = TELEGRAM_API_BASE.format(token=token)
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
 
     try:
-        resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        result = resp.json()
-        if result.get("ok"):
-            logger.info("Telegram message sent successfully.")
-            return True
-        else:
-            logger.error(
-                "Telegram API returned ok=false: %s", result.get("description")
-            )
-            return False
-    except requests.exceptions.HTTPError as exc:
-        logger.error("Telegram HTTP error: %s — Response: %s", exc, exc.response.text)
-        return False
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.error("Failed to send Telegram message: %s", exc, exc_info=True)
+        r = requests.post(
+            TG_URL.format(token=token),
+            json={
+                "chat_id": chat,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            },
+            timeout=TIMEOUT,
+        )
+        r.raise_for_status()
+        ok = r.json().get("ok", False)
+        if not ok:
+            logger.error("Telegram error: %s", r.json().get("description"))
+        return ok
+    except Exception as exc:
+        logger.error("Telegram send failed: %s", exc)
         return False
 
 
-def _escape_html(text: str) -> str:
-    """Escape HTML special characters for Telegram HTML parse mode."""
-    return (
-        text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-    )
+def _esc(s: str) -> str:
+    """Escape HTML special chars for Telegram HTML parse mode."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

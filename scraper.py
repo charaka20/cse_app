@@ -1,265 +1,152 @@
 """
 scraper.py
 ----------
-Monitors the Colombo Stock Exchange (CSE) announcements feed.
+HTML scraping layer for CSE announcements.
+Targets: https://cse.lk/announcements
+Filters: "DEALINGS BY DIRECTORS" | "Interim Financial Statements"
 
-CSE API uses POST requests (not GET) to the following endpoints:
-  Primary:  POST https://www.cse.lk/api/approvedAnnouncement
-  Fallback: POST https://www.cse.lk/api/getFinancialAnnouncement
-
-Both return JSON arrays of announcement objects.
-
-Target announcement types:
-  - "DEALINGS BY DIRECTORS"
-  - "Interim Financial Statements"
-
-On any unhandled exception, a Telegram health alert is fired immediately.
+On DOM layout failure → notifier.send_health_alert() fires immediately.
 """
 
 import logging
 import requests
-from typing import Optional
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-CSE_API_BASE = "https://www.cse.lk/api/"
+URL = "https://www.cse.lk/announcements"
 
-# CSE uses POST endpoints (reverse-engineered from the cse.lk web portal)
-CSE_ENDPOINTS = [
-    "approvedAnnouncement",       # General approved announcements (primary)
-    "getFinancialAnnouncement",   # Financial announcements (fallback)
-]
-
-PDF_BASE_URL = "https://www.cse.lk"
-
-TARGET_KEYWORDS = [
-    "DEALINGS BY DIRECTORS",
-    "Interim Financial Statements",
-    "interim financial statements",
-    "dealings by directors",
-]
-
-REQUEST_TIMEOUT = 20  # seconds
-REQUEST_HEADERS = {
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/plain, */*",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Content-Type": "application/json",
-    "Origin": "https://www.cse.lk",
     "Referer": "https://www.cse.lk/",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
+FILTERS = [
+    "dealings by directors",
+    "interim financial statements",
+]
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+
 def get_announcements() -> list[dict]:
     """
-    Fetch and return filtered CSE announcements.
+    Scrape the CSE announcements page and return filtered rows.
 
-    Returns a list of dicts:
-        {
-            "id":       str,   # unique announcement identifier
-            "title":    str,   # announcement subject/title
-            "company":  str,   # listed company name
-            "pdf_url":  str,   # absolute URL to the linked PDF
-        }
-
-    On failure: fires a Telegram health alert and returns an empty list.
+    Returns list of:
+        {"id": str, "company": str, "description": str, "pdf_url": str}
     """
     try:
-        announcements = []
+        resp = requests.get(URL, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
 
-        for endpoint in CSE_ENDPOINTS:
-            logger.info("Trying CSE endpoint: %s", endpoint)
-            items = _fetch_from_endpoint(endpoint)
-            if items:
-                announcements = items
-                logger.info(
-                    "Endpoint '%s' returned %d items.", endpoint, len(items)
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # ── Locate the announcements table ─────────────────────────────────
+        # CSE renders a <table> with announcement rows — find it by content
+        table = (
+            soup.find("table", {"id": lambda x: x and "announcement" in x.lower()})
+            or soup.find("table", class_=lambda x: x and "announcement" in x.lower())
+            or soup.find("table")   # last resort: first table on page
+        )
+
+        if not table:
+            raise ValueError("Announcements table not found in DOM.")
+
+        rows = table.find_all("tr")
+        if not rows:
+            raise ValueError("No <tr> rows found inside announcements table.")
+
+        results = []
+
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) < 3:
+                continue  # skip header rows or empty rows
+
+            # ── Extract fields from cells ──────────────────────────────────
+            # Typical CSE table layout: [ID | Date | Company | Description | PDF]
+            # We try multiple index positions to be layout-resilient.
+            ann_id   = _text(cells[0])
+            company  = _text(cells[1]) if len(cells) > 1 else ""
+            desc     = _text(cells[2]) if len(cells) > 2 else ""
+
+            # If company column looks like a date, shift right
+            if _looks_like_date(company) and len(cells) > 3:
+                company = _text(cells[2])
+                desc    = _text(cells[3]) if len(cells) > 3 else ""
+
+            # ── Filter by description ──────────────────────────────────────
+            if not any(f in desc.lower() for f in FILTERS):
+                continue
+
+            # ── Extract PDF link ───────────────────────────────────────────
+            pdf_tag = row.find("a", href=lambda h: h and h.lower().endswith(".pdf"))
+            if not pdf_tag:
+                # Also look for any link containing "pdf" or "download"
+                pdf_tag = row.find(
+                    "a",
+                    href=lambda h: h and ("pdf" in h.lower() or "download" in h.lower()),
                 )
-                break
 
-        if not announcements:
-            logger.warning(
-                "All CSE endpoints returned empty. Market may be closed "
-                "or no announcements today."
-            )
-            return []
+            if not pdf_tag:
+                continue  # no PDF attached, skip
 
-        filtered = _filter_relevant(announcements)
+            pdf_url = _make_absolute(pdf_tag["href"])
+
+            # Use PDF filename as ID fallback if cell ID is blank
+            if not ann_id:
+                ann_id = pdf_url.rstrip("/").split("/")[-1]
+
+            results.append({
+                "id":          ann_id,
+                "company":     company,
+                "description": desc,
+                "pdf_url":     pdf_url,
+            })
+
         logger.info(
-            "Scraper found %d relevant announcement(s) out of %d total.",
-            len(filtered),
-            len(announcements),
+            "Scraper: %d relevant announcement(s) found from %d total rows.",
+            len(results), len(rows),
         )
-        return filtered
+        return results
 
-    except Exception as exc:  # pylint: disable=broad-except
-        error_msg = (
-            f"[CSE Scraper] ⚠️ API layout may have changed.\n"
-            f"Exception: {type(exc).__name__}: {exc}"
+    except Exception as exc:
+        _alert(
+            f"[CSE Scraper] ⚠️ DOM layout broken or page unreachable.\n"
+            f"{type(exc).__name__}: {exc}"
         )
-        logger.error(error_msg, exc_info=True)
-        _fire_health_alert(error_msg)
         return []
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Helpers
 # ---------------------------------------------------------------------------
-def _fetch_from_endpoint(endpoint: str) -> list[dict]:
-    """
-    POST to a CSE API endpoint and return normalised announcement list.
-    The CSE API accepts an empty JSON body {} for listing all announcements.
-    """
-    url = CSE_API_BASE + endpoint
-
-    # Try with empty body first, then with common filter params
-    payloads = [
-        {},
-        {"pageNo": 0, "pageSize": 50},
-        {"pageNo": "0", "pageSize": "50", "language": "en"},
-    ]
-
-    for payload in payloads:
-        try:
-            resp = requests.post(
-                url,
-                json=payload,
-                headers=REQUEST_HEADERS,
-                timeout=REQUEST_TIMEOUT,
-            )
-
-            if resp.status_code == 200:
-                data = resp.json()
-                items = _unwrap_response(data)
-                if items:
-                    return [_normalise_item(item) for item in items
-                            if _has_pdf(item)]
-            else:
-                logger.debug(
-                    "Endpoint %s returned HTTP %d with payload %s",
-                    endpoint, resp.status_code, payload
-                )
-
-        except requests.exceptions.RequestException as exc:
-            logger.debug("Request failed for %s: %s", endpoint, exc)
-            continue
-
-    return []
+def _text(tag) -> str:
+    return tag.get_text(separator=" ", strip=True) if tag else ""
 
 
-def _unwrap_response(data) -> list:
-    """
-    CSE API may return:
-      - A plain list:            [{...}, {...}]
-      - A wrapped dict:          {"announcements": [...]}
-      - A paginated dict:        {"data": [...], "total": N}
-    """
-    if isinstance(data, list):
-        return data
-
-    if isinstance(data, dict):
-        for key in ("announcements", "data", "results", "content",
-                    "responseData", "list", "items"):
-            if isinstance(data.get(key), list):
-                return data[key]
-
-    return []
+def _looks_like_date(s: str) -> bool:
+    """Rough check: does this string look like a date (e.g. '2026-06-24')?"""
+    import re
+    return bool(re.match(r"\d{2,4}[-/]\d{1,2}[-/]\d{1,2}", s.strip()))
 
 
-def _normalise_item(item: dict) -> dict:
-    """Map a raw API item to our canonical announcement schema."""
-    ann_id = str(
-        item.get("id")
-        or item.get("announcementId")
-        or item.get("announcement_id")
-        or item.get("annId")
-        or ""
-    )
-    title = (
-        item.get("subject")
-        or item.get("title")
-        or item.get("announcementType")
-        or item.get("type")
-        or ""
-    )
-    company = (
-        item.get("companyName")
-        or item.get("company")
-        or item.get("symbol")
-        or item.get("stockSymbol")
-        or ""
-    )
-    raw_pdf = (
-        item.get("fileUrl")
-        or item.get("pdfUrl")
-        or item.get("pdf_url")
-        or item.get("attachmentUrl")
-        or item.get("fileLink")
-        or item.get("url")
-        or ""
-    )
-    pdf_url = _make_absolute(raw_pdf)
-
-    # Derive a stable ID from the PDF URL if no ID field found
-    if not ann_id and pdf_url:
-        ann_id = _derive_id_from_url(pdf_url)
-
-    return {
-        "id": ann_id,
-        "title": title,
-        "company": company,
-        "pdf_url": pdf_url,
-        "_raw": item,  # keep raw data for debugging
-    }
+def _make_absolute(href: str) -> str:
+    if href.startswith("http"):
+        return href
+    return "https://www.cse.lk" + href if href.startswith("/") else href
 
 
-def _filter_relevant(announcements: list[dict]) -> list[dict]:
-    """Keep only announcements whose title matches our target keywords."""
-    relevant = []
-    for ann in announcements:
-        title_upper = ann.get("title", "").upper()
-        if any(kw.upper() in title_upper for kw in TARGET_KEYWORDS):
-            relevant.append(ann)
-    return relevant
-
-
-def _has_pdf(item: dict) -> bool:
-    """Return True if the raw API item has any PDF URL field populated."""
-    pdf_keys = ("fileUrl", "pdfUrl", "pdf_url", "attachmentUrl",
-                 "fileLink", "url")
-    return any(item.get(k) for k in pdf_keys)
-
-
-def _make_absolute(url: str) -> str:
-    """Ensure the URL is absolute; prepend CSE base if it starts with '/'."""
-    if not url:
-        return ""
-    if url.startswith("http"):
-        return url
-    return PDF_BASE_URL + url if url.startswith("/") else url
-
-
-def _derive_id_from_url(url: str) -> str:
-    """Last resort: use the PDF filename as a stable deduplication key."""
-    return url.rstrip("/").split("/")[-1]
-
-
-def _fire_health_alert(message: str) -> None:
-    """Lazy-import notifier to avoid circular import issues."""
+def _alert(msg: str) -> None:
     try:
-        from notifier import send_health_alert  # noqa: PLC0415
-        send_health_alert(message)
-    except Exception as notify_exc:  # pylint: disable=broad-except
-        logger.error(
-            "Failed to send health alert: %s", notify_exc, exc_info=True
-        )
+        from notifier import send_health_alert
+        send_health_alert(msg)
+    except Exception as e:
+        logger.error("Health alert failed: %s", e)
