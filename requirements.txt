@@ -1,0 +1,19 @@
+# CSE Tracker — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# ── HTTP & Scraping ──────────────────────────────────────────────────────────
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.2.2                  # Fast HTML/XML parser backend for BeautifulSoup
+
+# ── PDF Processing ───────────────────────────────────────────────────────────
+pdfplumber==0.11.0           # Primary text extraction from PDFs
+pdf2image==1.17.0            # Converts PDF pages to PIL images (OCR fallback)
+Pillow==10.3.0               # PIL image processing (required by pdf2image)
+pytesseract==0.3.10          # Python wrapper for Tesseract OCR engine
+
+# ── AI / LLM ─────────────────────────────────────────────────────────────────
+google-generativeai==0.7.2   # Google Gemini API client
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1         # Load .env file for local development

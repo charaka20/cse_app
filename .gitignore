@@ -1,0 +1,38 @@
+# .gitignore for CSE Tracker
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Environment — contains API keys, NEVER commit
+.env
+
+# SQLite database — runtime state, tracked via GitHub Actions cache
+# Uncomment the line below if you want to exclude it from git entirely.
+# cse_state.db
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

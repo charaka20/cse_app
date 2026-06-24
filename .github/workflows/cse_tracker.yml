@@ -1,0 +1,122 @@
+name: CSE Tracker — Market Hours Monitor
+
+on:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Cron schedule: every 15 minutes during CSE trading hours
+  #
+  # CSE market hours: Monday–Friday, 09:30–14:30 Sri Lanka Time (UTC+5:30)
+  #
+  # Converted to UTC (subtract 5:30):
+  #   09:30 LKT = 04:00 UTC
+  #   14:30 LKT = 09:00 UTC
+  #
+  # We add a ±30 min buffer to catch pre/post-market announcements:
+  #   Start: 03:30 UTC  (= 09:00 LKT)
+  #   End:   09:30 UTC  (= 15:00 LKT)
+  #
+  # GitHub Actions cron uses UTC. The expression below runs every 15 minutes
+  # between 03:30 and 09:30 UTC, Monday through Friday.
+  # ──────────────────────────────────────────────────────────────────────────
+  schedule:
+    - cron: "*/15 3-9 * * 1-5"
+
+  # Manual trigger — for testing and first-time verification
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run in dry-run mode (no LLM calls, no Telegram alerts)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+# Prevent parallel runs from conflicting on the shared SQLite DB cache
+concurrency:
+  group: cse-tracker-run
+  cancel-in-progress: false
+
+jobs:
+  track:
+    name: "Monitor CSE Announcements"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+      # ── 1. Checkout repository ──────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python 3.10 ──────────────────────────────────────────
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      # ── 3. Install system dependencies (Tesseract OCR + Poppler) ───────
+      #    Tesseract:  Required by pytesseract for OCR on scanned PDFs.
+      #    Poppler:    Required by pdf2image to convert PDF pages to images.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            tesseract-ocr \
+            tesseract-ocr-eng \
+            poppler-utils
+          tesseract --version
+          pdftoppm -v 2>&1 | head -1
+
+      # ── 4. Install Python dependencies ─────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 5. Restore SQLite state DB from cache ──────────────────────────
+      #    The DB stores processed announcement IDs for deduplication.
+      #    Using a fixed cache key with restore-keys so it always restores
+      #    the latest available snapshot even if the key changed.
+      - name: Restore SQLite state DB
+        id: cache-db
+        uses: actions/cache/restore@v4
+        with:
+          path: cse_state.db
+          key: cse-state-db-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            cse-state-db-${{ runner.os }}-
+
+      # ── 6. Run the tracker ──────────────────────────────────────────────
+      - name: Run CSE Tracker
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "Running in DRY RUN mode"
+            python main.py --dry-run
+          else
+            python main.py
+          fi
+
+      # ── 7. Save SQLite state DB to cache ───────────────────────────────
+      #    Always save, even if the run failed (DB may have been updated
+      #    with partial results).
+      - name: Save SQLite state DB
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: cse_state.db
+          key: cse-state-db-${{ runner.os }}-${{ github.run_id }}
+
+      # ── 8. Upload DB as artifact (30-day retention for debugging) ───────
+      - name: Upload state DB as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cse-state-db-${{ github.run_number }}
+          path: cse_state.db
+          retention-days: 30
+          if-no-files-found: ignore
