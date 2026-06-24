@@ -2,8 +2,12 @@
 scraper.py
 ----------
 Monitors the Colombo Stock Exchange (CSE) announcements feed.
-Primary:  CSE JSON API  (structured, reliable)
-Fallback: HTML scraping via BeautifulSoup (in case API endpoint changes)
+
+CSE API uses POST requests (not GET) to the following endpoints:
+  Primary:  POST https://www.cse.lk/api/approvedAnnouncement
+  Fallback: POST https://www.cse.lk/api/getFinancialAnnouncement
+
+Both return JSON arrays of announcement objects.
 
 Target announcement types:
   - "DEALINGS BY DIRECTORS"
@@ -12,25 +16,23 @@ Target announcement types:
 On any unhandled exception, a Telegram health alert is fired immediately.
 """
 
-import os
 import logging
 import requests
-from bs4 import BeautifulSoup
 from typing import Optional
-
-# notifier import is deferred inside the except block to avoid circular imports
-# during unit-testing scraper.py in isolation.
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-CSE_API_URL = "https://www.cse.lk/api/announcements"
-CSE_HTML_URL = (
-    "https://www.cse.lk/pages/company-announcements/"
-    "company-announcements.component.html"
-)
+CSE_API_BASE = "https://www.cse.lk/api/"
+
+# CSE uses POST endpoints (reverse-engineered from the cse.lk web portal)
+CSE_ENDPOINTS = [
+    "approvedAnnouncement",       # General approved announcements (primary)
+    "getFinancialAnnouncement",   # Financial announcements (fallback)
+]
+
 PDF_BASE_URL = "https://www.cse.lk"
 
 TARGET_KEYWORDS = [
@@ -47,7 +49,10 @@ REQUEST_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/html, */*",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/json",
+    "Origin": "https://www.cse.lk",
     "Referer": "https://www.cse.lk/",
 }
 
@@ -67,14 +72,27 @@ def get_announcements() -> list[dict]:
             "pdf_url":  str,   # absolute URL to the linked PDF
         }
 
-    On failure: fires a Telegram health alert and returns an empty list
-    so main.py can continue without crashing.
+    On failure: fires a Telegram health alert and returns an empty list.
     """
     try:
-        announcements = _fetch_via_api()
+        announcements = []
+
+        for endpoint in CSE_ENDPOINTS:
+            logger.info("Trying CSE endpoint: %s", endpoint)
+            items = _fetch_from_endpoint(endpoint)
+            if items:
+                announcements = items
+                logger.info(
+                    "Endpoint '%s' returned %d items.", endpoint, len(items)
+                )
+                break
+
         if not announcements:
-            logger.info("API returned no results, attempting HTML fallback.")
-            announcements = _fetch_via_html()
+            logger.warning(
+                "All CSE endpoints returned empty. Market may be closed "
+                "or no announcements today."
+            )
+            return []
 
         filtered = _filter_relevant(announcements)
         logger.info(
@@ -86,7 +104,7 @@ def get_announcements() -> list[dict]:
 
     except Exception as exc:  # pylint: disable=broad-except
         error_msg = (
-            f"[CSE Scraper] ⚠️ DOM/API layout may have changed.\n"
+            f"[CSE Scraper] ⚠️ API layout may have changed.\n"
             f"Exception: {type(exc).__name__}: {exc}"
         )
         logger.error(error_msg, exc_info=True)
@@ -97,59 +115,88 @@ def get_announcements() -> list[dict]:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-def _fetch_via_api() -> list[dict]:
+def _fetch_from_endpoint(endpoint: str) -> list[dict]:
     """
-    Hit the CSE JSON API and normalise response into a flat list.
-    The API returns paginated JSON; we grab the first page (latest ~50).
+    POST to a CSE API endpoint and return normalised announcement list.
+    The CSE API accepts an empty JSON body {} for listing all announcements.
     """
-    params = {
-        "pageSize": 50,
-        "pageNo": 0,
-        "language": "en",
-    }
-    resp = requests.get(
-        CSE_API_URL,
-        params=params,
-        headers=REQUEST_HEADERS,
-        timeout=REQUEST_TIMEOUT,
-    )
-    resp.raise_for_status()
-    payload = resp.json()
+    url = CSE_API_BASE + endpoint
 
-    # CSE API nests results differently depending on endpoint version;
-    # handle both common shapes gracefully.
-    items: list = []
-    if isinstance(payload, list):
-        items = payload
-    elif isinstance(payload, dict):
-        # Try common wrapper keys in priority order
-        for key in ("announcements", "data", "results", "content"):
-            if key in payload and isinstance(payload[key], list):
-                items = payload[key]
-                break
+    # Try with empty body first, then with common filter params
+    payloads = [
+        {},
+        {"pageNo": 0, "pageSize": 50},
+        {"pageNo": "0", "pageSize": "50", "language": "en"},
+    ]
 
-    return [_normalise_api_item(item) for item in items if _has_pdf(item)]
+    for payload in payloads:
+        try:
+            resp = requests.post(
+                url,
+                json=payload,
+                headers=REQUEST_HEADERS,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                items = _unwrap_response(data)
+                if items:
+                    return [_normalise_item(item) for item in items
+                            if _has_pdf(item)]
+            else:
+                logger.debug(
+                    "Endpoint %s returned HTTP %d with payload %s",
+                    endpoint, resp.status_code, payload
+                )
+
+        except requests.exceptions.RequestException as exc:
+            logger.debug("Request failed for %s: %s", endpoint, exc)
+            continue
+
+    return []
 
 
-def _normalise_api_item(item: dict) -> dict:
-    """Map an API response dict to our canonical announcement schema."""
-    # Field names observed from CSE API (may vary; fall back gracefully)
+def _unwrap_response(data) -> list:
+    """
+    CSE API may return:
+      - A plain list:            [{...}, {...}]
+      - A wrapped dict:          {"announcements": [...]}
+      - A paginated dict:        {"data": [...], "total": N}
+    """
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        for key in ("announcements", "data", "results", "content",
+                    "responseData", "list", "items"):
+            if isinstance(data.get(key), list):
+                return data[key]
+
+    return []
+
+
+def _normalise_item(item: dict) -> dict:
+    """Map a raw API item to our canonical announcement schema."""
     ann_id = str(
         item.get("id")
         or item.get("announcementId")
         or item.get("announcement_id")
+        or item.get("annId")
         or ""
     )
     title = (
         item.get("subject")
         or item.get("title")
         or item.get("announcementType")
+        or item.get("type")
         or ""
     )
     company = (
         item.get("companyName")
         or item.get("company")
         or item.get("symbol")
+        or item.get("stockSymbol")
         or ""
     )
     raw_pdf = (
@@ -157,65 +204,23 @@ def _normalise_api_item(item: dict) -> dict:
         or item.get("pdfUrl")
         or item.get("pdf_url")
         or item.get("attachmentUrl")
+        or item.get("fileLink")
+        or item.get("url")
         or ""
     )
     pdf_url = _make_absolute(raw_pdf)
+
+    # Derive a stable ID from the PDF URL if no ID field found
+    if not ann_id and pdf_url:
+        ann_id = _derive_id_from_url(pdf_url)
 
     return {
         "id": ann_id,
         "title": title,
         "company": company,
         "pdf_url": pdf_url,
+        "_raw": item,  # keep raw data for debugging
     }
-
-
-def _fetch_via_html() -> list[dict]:
-    """
-    BeautifulSoup fallback — parse the CSE announcements HTML page.
-    Looks for <tr> rows containing announcement data and a PDF link.
-    """
-    resp = requests.get(
-        CSE_HTML_URL,
-        headers=REQUEST_HEADERS,
-        timeout=REQUEST_TIMEOUT,
-    )
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    announcements: list[dict] = []
-    # CSE uses a table with rows for each announcement
-    for row in soup.select("table tr, .announcement-row, .announcement-item"):
-        pdf_tag = row.find("a", href=lambda h: h and h.lower().endswith(".pdf"))
-        if not pdf_tag:
-            continue
-
-        cells = row.find_all("td")
-        ann_id = ""
-        title = ""
-        company = ""
-
-        if len(cells) >= 3:
-            ann_id = cells[0].get_text(strip=True)
-            company = cells[1].get_text(strip=True)
-            title = cells[2].get_text(strip=True)
-        elif len(cells) >= 1:
-            title = cells[0].get_text(strip=True)
-
-        # Try to extract ID from row attributes or data attributes
-        ann_id = ann_id or row.get("data-id", "") or row.get("id", "")
-
-        pdf_url = _make_absolute(pdf_tag["href"])
-        if pdf_url:
-            announcements.append(
-                {
-                    "id": ann_id or _derive_id_from_url(pdf_url),
-                    "title": title,
-                    "company": company,
-                    "pdf_url": pdf_url,
-                }
-            )
-
-    return announcements
 
 
 def _filter_relevant(announcements: list[dict]) -> list[dict]:
@@ -229,8 +234,9 @@ def _filter_relevant(announcements: list[dict]) -> list[dict]:
 
 
 def _has_pdf(item: dict) -> bool:
-    """Return True if the raw API item has any PDF URL field."""
-    pdf_keys = ("fileUrl", "pdfUrl", "pdf_url", "attachmentUrl")
+    """Return True if the raw API item has any PDF URL field populated."""
+    pdf_keys = ("fileUrl", "pdfUrl", "pdf_url", "attachmentUrl",
+                 "fileLink", "url")
     return any(item.get(k) for k in pdf_keys)
 
 
